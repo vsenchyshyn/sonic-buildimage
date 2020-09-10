@@ -14,6 +14,7 @@ import os.path
 
 try:
     from sonic_platform_base.thermal_base import ThermalBase
+    from helper import APIHelper
 except ImportError as e:
     raise ImportError(str(e) + "- required module not found")
 
@@ -27,6 +28,7 @@ class Thermal(ThermalBase):
 
     def __init__(self, thermal_index):
         self.index = thermal_index
+        self._api_helper = APIHelper()
 
         # Add thermal name
         self.THERMAL_NAME_LIST.append("Front-panel temp sensor 1")
@@ -37,32 +39,22 @@ class Thermal(ThermalBase):
 
         # Set hwmon path
         i2c_path = {
-            0: "i2c-5/5-0048",    # u4 system-inlet
-            1: "i2c-6/6-0049",    # u2 system-inlet
-            2: "i2c-7/7-004a",    # u44 bmc56960-on-board
-            3: "i2c-14/14-0048",  # u9200 cpu-on-board
-            4: "i2c-15/15-004e"   # u9201 system-outlet
+            0: "i2c-5/5-0048/hwmon/hwmon1",    # u4 system-inlet
+            1: "i2c-6/6-0049/hwmon/hwmon2",    # u2 system-inlet
+            2: "i2c-7/7-004a/hwmon/hwmon3",    # u44 bmc56960-on-board
+            3: "i2c-14/14-0048/hwmon/hwmon4",  # u9200 cpu-on-board
+            4: "i2c-15/15-004e/hwmon/hwmon5"   # u9201 system-outlet
         }.get(self.index, None)
 
-        self.ss_path = "{}/{}/hwmon".format(self.I2C_ADAPTER_PATH, i2c_path)
+        self.hwmon_path = "{}/{}".format(self.I2C_ADAPTER_PATH, i2c_path)
         self.ss_key = self.THERMAL_NAME_LIST[self.index]
         self.ss_index = 1
-        self.hwmon_name = os.listdir(self.ss_path)[0]
-        self.hwmon_path = os.path.join(self.ss_path, self.hwmon_name)
-
-    def __read_txt_file(self, file_path):
-        try:
-            with open(file_path, 'r') as fd:
-                data = fd.read()
-                return data.strip()
-        except IOError:
-            raise IOError("Unable to open %s file !" % file_path)
 
     def __get_temp(self, temp_file):
         temp_file_path = os.path.join(self.hwmon_path, temp_file)
-        raw_temp = self.__read_txt_file(temp_file_path)
+        raw_temp = self._api_helper.read_txt_file(temp_file_path)
         temp = float(raw_temp)/1000
-        return "{:.3f}".format(temp)
+        return float("{:.3f}".format(temp))
 
     def __set_threshold(self, file_name, temperature):
         temp_file_path = os.path.join(self.hwmon_path, file_name)

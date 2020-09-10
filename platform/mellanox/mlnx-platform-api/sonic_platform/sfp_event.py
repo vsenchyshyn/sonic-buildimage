@@ -9,69 +9,168 @@ import os
 import time
 import select
 from python_sdk_api.sx_api import *
-from sonic_daemon_base.daemon_base import Logger
+from sonic_py_common.logger import Logger
 
-SYSLOG_IDENTIFIER = "sfp-event"
-
-SDK_SFP_STATE_IN = 0x1
+# SFP status from PMAOS register
+# 0x1 plug in
+# 0x2 plug out
+# 0x3 plug in with error
+# 0x4 disabled, at this status SFP eeprom is not accessible, 
+#     and presence status also will be not present, 
+#     so treate it as plug out.
+SDK_SFP_STATE_IN  = 0x1
 SDK_SFP_STATE_OUT = 0x2
+SDK_SFP_STATE_ERR = 0x3
+SDK_SFP_STATE_DIS = 0x4
+
+# SFP status that will be handled by XCVRD 
 STATUS_PLUGIN = '1'
 STATUS_PLUGOUT = '0'
-STATUS_UNKNOWN = '2'
+STATUS_ERR_I2C_STUCK = '2'
+STATUS_ERR_BAD_EEPROM = '3'
+STATUS_ERR_UNSUPPORTED_CABLE = '4'
+STATUS_ERR_HIGH_TEMP = '5'
+STATUS_ERR_BAD_CABLE = '6'
+
+# SFP status used in this file only, will not expose to XCVRD
+# STATUS_ERROR will be mapped to different status according to the error code
+STATUS_UNKNOWN = '-1'
+STATUS_ERROR   = '-2'
+
+# SFP error code, only valid when SFP at SDK_SFP_STATE_ERR status
+# Only 0x2, 0x3, 0x5, 0x6 and 0x7 will block the eeprom access,
+# so will only report above errors to XCVRD and other errors will be 
+# printed to syslog. 
+
+'''
+0x0: "Power_Budget_Exceeded",
+0x1: "Long_Range_for_non_MLNX_cable_or_module",
+0x2: "Bus_stuck",
+0x3: "bad_or_unsupported_EEPROM",
+0x4: "Enforce_part_number_list",
+0x5: "unsupported_cable",
+0x6: "High_Temperature",
+0x7: "bad_cable",
+0x8: "PMD_type_is_not_enabled",
+0x9: "[internal]Laster_TEC_failure",
+0xa: "[internal]High_current",
+0xb: "[internal]High_voltage",
+0xd: "[internal]High_power",
+0xe: "[internal]Module_state_machine_fault",
+0xc: "pcie_system_power_slot_Exceeded"
+'''
+
+# SFP errors that will block eeprom accessing
+sdk_sfp_err_type_dict = {
+    0x2: STATUS_ERR_I2C_STUCK,
+    0x3: STATUS_ERR_BAD_EEPROM,
+    0x5: STATUS_ERR_UNSUPPORTED_CABLE,
+    0x6: STATUS_ERR_HIGH_TEMP,
+    0x7: STATUS_ERR_BAD_CABLE
+}
 
 sfp_value_status_dict = {
-        SDK_SFP_STATE_IN:  STATUS_PLUGIN,
-        SDK_SFP_STATE_OUT: STATUS_PLUGOUT,
+    SDK_SFP_STATE_IN:  STATUS_PLUGIN,
+    SDK_SFP_STATE_OUT: STATUS_PLUGOUT,
+    SDK_SFP_STATE_ERR: STATUS_ERROR,
+    SDK_SFP_STATE_DIS: STATUS_PLUGOUT,
 }
+
+# system level event/error
+EVENT_ON_ALL_SFP = '-1'
+SYSTEM_NOT_READY = 'system_not_ready'
+SYSTEM_READY = 'system_become_ready'
+SYSTEM_FAIL = 'system_fail'
+
+SDK_DAEMON_READY_FILE = '/tmp/sdk_ready'
 
 PMPE_PACKET_SIZE = 2000
 
-logger = Logger(SYSLOG_IDENTIFIER)
+logger = Logger()
 
 class sfp_event:
     ''' Listen to plugin/plugout cable events '''
 
-    SX_OPEN_RETRIES = 20
+    SX_OPEN_RETRIES = 30
+    SX_OPEN_TIMEOUT = 5
+    SELECT_TIMEOUT = 1
 
     def __init__(self):
         self.swid = 0
         self.handle = None
 
-    def initialize(self):
-        # open SDK API handle.
-        # retry at most SX_OPEN_RETRIES times to wait until SDK is started during system startup
-        retry = 1
-        while True:
-            rc, self.handle = sx_api_open(None)
-            if rc == SX_STATUS_SUCCESS:
-                break
-
-            logger.log_info("failed to open SDK API handle... retrying {}".format(retry))
-
-            time.sleep(2 ** retry)
-            retry += 1
-
-            if retry > self.SX_OPEN_RETRIES:
-                raise RuntimeError("failed to open SDK API handle after {} retries".format(retry))
-
         # Allocate SDK fd and user channel structures
         self.rx_fd_p = new_sx_fd_t_p()
         self.user_channel_p = new_sx_user_channel_t_p()
 
-        rc = sx_api_host_ifc_open(self.handle, self.rx_fd_p)
-        if rc != SX_STATUS_SUCCESS:
-            raise RuntimeError("sx_api_host_ifc_open exited with error, rc {}".format(rc))
+    def initialize(self):
+        swid_cnt_p = None
 
-        self.user_channel_p.type = SX_USER_CHANNEL_TYPE_FD
-        self.user_channel_p.channel.fd = self.rx_fd_p
+        try:
+            # Wait for SDK daemon to be started with detect the sdk_ready file
+            retry = 0
+            while not os.path.exists(SDK_DAEMON_READY_FILE):  
+                if retry >= self.SX_OPEN_RETRIES:
+                    raise RuntimeError("SDK daemon failed to start after {} retries and {} seconds waiting, exiting..."
+                        .format(retry, self.SX_OPEN_TIMEOUT * self.SX_OPEN_RETRIES))
+                else:
+                    logger.log_info("SDK daemon not started yet, retry {} times".format(retry))
+                    retry += 1
+                    time.sleep(self.SX_OPEN_TIMEOUT)
 
-        rc = sx_api_host_ifc_trap_id_register_set(self.handle,
-                                                  SX_ACCESS_CMD_REGISTER,
-                                                  self.swid,
-                                                  SX_TRAP_ID_PMPE,
-                                                  self.user_channel_p)
-        if rc != SX_STATUS_SUCCESS:
-            raise RuntimeError("sx_api_host_ifc_trap_id_register_set exited with error, rc {}".format(rc))
+            # After SDK daemon started, sx_api_open and sx_api_host_ifc_open is ready for call
+            rc, self.handle = sx_api_open(None)
+            if rc != SX_STATUS_SUCCESS:
+                raise RuntimeError("failed to call sx_api_open with rc {}, exiting...".format(rc))
+
+            rc = sx_api_host_ifc_open(self.handle, self.rx_fd_p)
+            if rc != SX_STATUS_SUCCESS:
+                raise RuntimeError("failed to call sx_api_host_ifc_open with rc {}, exiting...".format(rc))
+
+            self.user_channel_p.type = SX_USER_CHANNEL_TYPE_FD
+            self.user_channel_p.channel.fd = self.rx_fd_p
+
+            # Wait for switch to be created and initialized inside SDK
+            retry = 0
+            swid_cnt_p = new_uint32_t_p()
+            uint32_t_p_assign(swid_cnt_p, 0)
+            swid_cnt = 0
+            while True:
+                if retry >= self.SX_OPEN_RETRIES:
+                    raise RuntimeError("switch not created after {} retries and {} seconds waiting, exiting..."
+                        .format(retry, self.SX_OPEN_RETRIES * self.SX_OPEN_TIMEOUT))
+                else:
+                    rc = sx_api_port_swid_list_get(self.handle, None, swid_cnt_p)
+                    if rc == SX_STATUS_SUCCESS:
+                        swid_cnt = uint32_t_p_value(swid_cnt_p)
+                        if swid_cnt > 0:
+                            delete_uint32_t_p(swid_cnt_p)
+                            swid_cnt_p = None
+                            break
+                        else:
+                            logger.log_info("switch not created yet, swid_cnt {}, retry {} times and wait for {} seconds"
+                                .format(swid_cnt, retry, self.SX_OPEN_TIMEOUT * retry))
+                    else:
+                        raise RuntimeError("sx_api_port_swid_list_get fail with rc {}, retry {} times and wait for {} seconds".
+                            format(rc, retry, self.SX_OPEN_TIMEOUT * retry))
+
+                    retry += 1
+                    time.sleep(self.SX_OPEN_TIMEOUT)
+
+            # After switch was created inside SDK, sx_api_host_ifc_trap_id_register_set is ready to call
+            rc = sx_api_host_ifc_trap_id_register_set(self.handle,
+                                                    SX_ACCESS_CMD_REGISTER,
+                                                    self.swid,
+                                                    SX_TRAP_ID_PMPE,
+                                                    self.user_channel_p)
+
+            if rc != SX_STATUS_SUCCESS:
+                raise RuntimeError("sx_api_host_ifc_trap_id_register_set failed with rc {}, exiting...".format(rc))
+        except Exception as e:
+            logger.log_error("sfp_event initialization failed due to {}, exiting...".format(repr(e)))
+            if swid_cnt_p is not None:
+                delete_uint32_t_p(swid_cnt_p)
+            self.deinitialize()
 
     def deinitialize(self):
         if self.handle is None:
@@ -129,7 +228,7 @@ class sfp_event:
 
         for fd in read:
             if fd == self.rx_fd_p.fd:
-                success, port_list, module_state = self.on_pmpe(self.rx_fd_p)
+                success, port_list, module_state, error_type = self.on_pmpe(self.rx_fd_p)
                 if not success:
                     logger.log_error("failed to read from {}".format(fd))
                     break
@@ -147,15 +246,23 @@ class sfp_event:
                     found += 1
                     continue
 
+                # If get SFP status error(0x3) from SDK, then need to read the error_type to get the detailed error
+                if sfp_state == STATUS_ERROR:
+                    if error_type in sdk_sfp_err_type_dict.keys():
+                        # In SFP at error status case, need to overwrite the sfp_state with the exact error code
+                        sfp_state = sdk_sfp_err_type_dict[error_type]
+                    else:
+                        # For errors don't block the eeprom accessing, we don't report it to XCVRD
+                        logger.log_info("SFP error on port but not blocking eeprom read, error_type {}".format(error_type))
+                        found +=1
+                        continue
+
                 for port in port_list:
                     logger.log_info("SFP on port {} state {}".format(port, sfp_state))
-                    port_change[port] = sfp_state
+                    port_change[port+1] = sfp_state
                     found += 1
 
-        if found == 0:
-            return False
-        else:
-            return True
+        return found != 0
 
     def on_pmpe(self, fd_p):
         ''' on port module plug event handler '''
@@ -183,7 +290,17 @@ class sfp_event:
             port_list_size = pmpe_t.list_size
             logical_port_list = pmpe_t.log_port_list
             module_state = pmpe_t.module_state
+            error_type = pmpe_t.error_type
+            module_id = pmpe_t.module_id
 
+            if module_state == SDK_SFP_STATE_ERR:
+                logger.log_error("Receive PMPE error event on module {}: status {} error type {}".format(module_id, module_state, error_type))
+            elif module_state == SDK_SFP_STATE_DIS:
+                logger.log_info("Receive PMPE disable event on module {}: status {}".format(module_id, module_state))
+            elif module_state == SDK_SFP_STATE_IN or module_state == SDK_SFP_STATE_OUT:
+                logger.log_info("Receive PMPE plug in/out event on module {}: status {}".format(module_id, module_state))
+            else:
+                logger.log_error("Receive PMPE unknown event on module {}: status {}".format(module_id, module_state))
             for i in xrange(port_list_size):
                 logical_port = sx_port_log_id_t_arr_getitem(logical_port_list, i)
                 rc = sx_api_port_device_get(self.handle, 1 , 0, port_attributes_list,  port_cnt_p)
@@ -202,4 +319,4 @@ class sfp_event:
         delete_sx_port_attributes_t_arr(port_attributes_list)
         delete_uint32_t_p(port_cnt_p)
 
-        return status, label_port_list, module_state,
+        return status, label_port_list, module_state, error_type

@@ -8,64 +8,79 @@
 #
 #############################################################################
 
-import sys
-import re
-import os
-import subprocess
-import json
-
 try:
+    import sys
     from sonic_platform_base.chassis_base import ChassisBase
-    from sonic_platform.fan import Fan
-    from sonic_platform.psu import Psu
-    from sonic_platform.component import Component
-    from sonic_platform.watchdog import Watchdog
-    from sonic_platform.thermal import Thermal
+    from helper import APIHelper
 except ImportError as e:
     raise ImportError(str(e) + "- required module not found")
 
-CONFIG_DB_PATH = "/etc/sonic/config_db.json"
-NUM_FAN = 5
+NUM_FAN_TRAY = 5
+NUM_FAN = 2
 NUM_PSU = 2
 NUM_THERMAL = 5
+NUM_SFP = 32
+NUM_COMPONENT = 5
 RESET_REGISTER = "0x103"
-REBOOT_CAUSE_PATH = "/host/reboot-cause/previous-reboot-cause.txt"
-COMPONENT_NAME_LIST = ["CPLD1", "CPLD2", "CPLD3", "CPLD4", "BIOS"]
+HOST_REBOOT_CAUSE_PATH = "/host/reboot-cause/"
+PMON_REBOOT_CAUSE_PATH = "/usr/share/sonic/platform/api_files/reboot-cause/"
+REBOOT_CAUSE_FILE = "reboot-cause.txt"
+PREV_REBOOT_CAUSE_FILE = "previous-reboot-cause.txt"
+HOST_CHK_CMD = "docker > /dev/null 2>&1"
 
 
 class Chassis(ChassisBase):
     """Platform-specific Chassis class"""
 
     def __init__(self):
-        self.config_data = {}
-        for index in range(0, NUM_FAN):
-            fan = Fan(index)
-            self._fan_list.append(fan)
+        ChassisBase.__init__(self)
+        self._api_helper = APIHelper()
+        self.sfp_module_initialized = False
+        self.__initialize_eeprom()
+        self.is_host = self._api_helper.is_host()
+
+        if not self.is_host:
+            self.__initialize_fan()
+            self.__initialize_psu()
+            self.__initialize_thermals()
+        else:
+            self.__initialize_components()
+
+    def __initialize_sfp(self):
+        from sonic_platform.sfp import Sfp
+        for index in range(0, NUM_SFP):
+            sfp = Sfp(index)
+            self._sfp_list.append(sfp)
+        self.sfp_module_initialized = True
+
+    def __initialize_psu(self):
+        from sonic_platform.psu import Psu
         for index in range(0, NUM_PSU):
             psu = Psu(index)
             self._psu_list.append(psu)
+
+    def __initialize_fan(self):
+        from sonic_platform.fan import Fan
+        for fant_index in range(0, NUM_FAN_TRAY):
+            for fan_index in range(0, NUM_FAN):
+                fan = Fan(fant_index, fan_index)
+                self._fan_list.append(fan)
+
+    def __initialize_thermals(self):
+        from sonic_platform.thermal import Thermal
         for index in range(0, NUM_THERMAL):
             thermal = Thermal(index)
             self._thermal_list.append(thermal)
-        ChassisBase.__init__(self)
-        self._component_name_list = COMPONENT_NAME_LIST
-        self._watchdog = Watchdog()
 
-    def __read_config_db(self):
-        try:
-            with open(CONFIG_DB_PATH, 'r') as fd:
-                data = json.load(fd)
-                return data
-        except IOError:
-            raise IOError("Unable to open config_db file !")
+    def __initialize_eeprom(self):
+        from sonic_platform.eeprom import Tlv
+        self._eeprom = Tlv()
 
-    def __read_txt_file(self, file_path):
-        try:
-            with open(file_path, 'r') as fd:
-                data = fd.read()
-                return data.strip()
-        except IOError:
-            raise IOError("Unable to open %s file !" % file_path)
+    def __initialize_components(self):
+        from sonic_platform.component import Component
+        for index in range(0, NUM_COMPONENT):
+            component = Component(index)
+            self._component_list.append(component)
 
     def get_base_mac(self):
         """
@@ -74,47 +89,29 @@ class Chassis(ChassisBase):
             A string containing the MAC address in the format
             'XX:XX:XX:XX:XX:XX'
         """
-        try:
-            self.config_data = self.__read_config_db()
-            base_mac = self.config_data["DEVICE_METADATA"]["localhost"]["mac"]
-            return str(base_mac)
-        except KeyError:
-            return str(None)
+        return self._eeprom.get_mac()
 
-    def get_firmware_version(self, component_name):
+    def get_serial_number(self):
         """
-        Retrieves platform-specific hardware/firmware versions for chassis
-        componenets such as BIOS, CPLD, FPGA, etc.
-        Args:
-            type: A string, component name
-
+        Retrieves the hardware serial number for the chassis
         Returns:
-            A string containing platform-specific component versions
+            A string containing the hardware serial number for this chassis.
         """
-        self.component = Component(component_name)
-        if component_name not in self._component_name_list:
-            return None
-        return self.component.get_firmware_version()
+        return self._eeprom.get_serial()
 
-    def install_component_firmware(self, component_name, image_path):
+    def get_system_eeprom_info(self):
         """
-        Install firmware to module
-        Args:
-            type: A string, component name.
-            image_path: A string, path to firmware image.
-
+        Retrieves the full content of system EEPROM information for the chassis
         Returns:
-            A boolean, True if install successfully, False if not
+            A dictionary where keys are the type code defined in
+            OCP ONIE TlvInfo EEPROM format and values are their corresponding
+            values.
         """
-        self.component = Component(component_name)
-        if component_name not in self._component_name_list:
-            return False
-        return self.component.upgrade_firmware(image_path)
+        return self._eeprom.get_eeprom()
 
     def get_reboot_cause(self):
         """
         Retrieves the cause of the previous reboot
-
         Returns:
             A tuple (string, string) where the first element is a string
             containing the cause of the previous reboot. This string must be
@@ -122,17 +119,27 @@ class Chassis(ChassisBase):
             is "REBOOT_CAUSE_HARDWARE_OTHER", the second string can be used
             to pass a description of the reboot cause.
         """
-        self.component = Component("CPLD1")
         description = 'None'
         reboot_cause = self.REBOOT_CAUSE_HARDWARE_OTHER
-        hw_reboot_cause = self.component.get_register_value(RESET_REGISTER)
-        sw_reboot_cause = self.__read_txt_file(REBOOT_CAUSE_PATH)
 
-        if sw_reboot_cause != "Unexpected reboot":
+        reboot_cause_path = (HOST_REBOOT_CAUSE_PATH + REBOOT_CAUSE_FILE) if self.is_host else PMON_REBOOT_CAUSE_PATH + REBOOT_CAUSE_FILE
+        prev_reboot_cause_path = (HOST_REBOOT_CAUSE_PATH + PREV_REBOOT_CAUSE_FILE) if self.is_host else PMON_REBOOT_CAUSE_PATH + PREV_REBOOT_CAUSE_FILE
+
+        hw_reboot_cause = self._component_list[0].get_register_value(RESET_REGISTER)
+
+        sw_reboot_cause = self._api_helper.read_txt_file(
+            reboot_cause_path) or "Unknown"
+        prev_sw_reboot_cause = self._api_helper.read_txt_file(
+            prev_reboot_cause_path) or "Unknown"
+
+        if sw_reboot_cause == "Unknown" and (prev_sw_reboot_cause == "Unknown" or prev_sw_reboot_cause == self.REBOOT_CAUSE_POWER_LOSS) and hw_reboot_cause == "0x11":
+            reboot_cause = self.REBOOT_CAUSE_POWER_LOSS
+        elif sw_reboot_cause != "Unknown" and hw_reboot_cause == "0x11":
             reboot_cause = self.REBOOT_CAUSE_NON_HARDWARE
             description = sw_reboot_cause
-        elif hw_reboot_cause == "0x11":
-            reboot_cause = self.REBOOT_CAUSE_POWER_LOSS
+        elif prev_reboot_cause_path != "Unknown" and hw_reboot_cause == "0x11":
+            reboot_cause = self.REBOOT_CAUSE_NON_HARDWARE
+            description = prev_sw_reboot_cause
         elif hw_reboot_cause == "0x22":
             reboot_cause = self.REBOOT_CAUSE_WATCHDOG,
         else:
@@ -140,3 +147,114 @@ class Chassis(ChassisBase):
             description = 'Unknown reason'
 
         return (reboot_cause, description)
+
+    ##############################################################
+    ######################## SFP methods #########################
+    ##############################################################
+
+    def get_num_sfps(self):
+        """
+        Retrieves the number of sfps available on this chassis
+        Returns:
+            An integer, the number of sfps available on this chassis
+        """
+        if not self.sfp_module_initialized:
+            self.__initialize_sfp()
+
+        return len(self._sfp_list)
+
+    def get_all_sfps(self):
+        """
+        Retrieves all sfps available on this chassis
+        Returns:
+            A list of objects derived from SfpBase representing all sfps
+            available on this chassis
+        """
+        if not self.sfp_module_initialized:
+            self.__initialize_sfp()
+
+        return self._sfp_list
+
+    def get_sfp(self, index):
+        """
+        Retrieves sfp represented by (1-based) index <index>
+        Args:
+            index: An integer, the index (1-based) of the sfp to retrieve.
+            The index should be the sequence of a physical port in a chassis,
+            starting from 1.
+            For example, 1 for Ethernet0, 2 for Ethernet4 and so on.
+        Returns:
+            An object dervied from SfpBase representing the specified sfp
+        """
+        sfp = None
+        if not self.sfp_module_initialized:
+            self.__initialize_sfp()
+
+        try:
+            # The index will start from 1
+            sfp = self._sfp_list[index-1]
+        except IndexError:
+            sys.stderr.write("SFP index {} out of range (1-{})\n".format(
+                             index, len(self._sfp_list)))
+        return sfp
+
+    ##############################################################
+    ####################### Other methods ########################
+    ##############################################################
+
+    def get_watchdog(self):
+        """
+        Retreives hardware watchdog device on this chassis
+        Returns:
+            An object derived from WatchdogBase representing the hardware
+            watchdog device
+        """
+        if self._watchdog is None:
+            from sonic_platform.watchdog import Watchdog
+            self._watchdog = Watchdog()
+
+        return self._watchdog
+
+    ##############################################################
+    ###################### Device methods ########################
+    ##############################################################
+
+    def get_name(self):
+        """
+        Retrieves the name of the device
+            Returns:
+            string: The name of the device
+        """
+        return self._api_helper.hwsku
+
+    def get_presence(self):
+        """
+        Retrieves the presence of the PSU
+        Returns:
+            bool: True if PSU is present, False if not
+        """
+        return True
+
+    def get_model(self):
+        """
+        Retrieves the model number (or part number) of the device
+        Returns:
+            string: Model/part number of device
+        """
+        return self._eeprom.get_pn()
+
+    def get_serial(self):
+        """
+        Retrieves the serial number of the device
+        Returns:
+            string: Serial number of device
+        """
+        return self.get_serial_number()
+
+    def get_status(self):
+        """
+        Retrieves the operational status of the device
+        Returns:
+            A boolean value, True if device is operating properly, False if not
+        """
+        return True
